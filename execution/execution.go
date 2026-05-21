@@ -18,6 +18,7 @@ package execution
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -212,6 +213,31 @@ func newSubqueryFunction(ctx context.Context, e *logicalplan.FunctionCall, t *lo
 	inner, err := newOperator(ctx, t.Expr, storage, nOpts, hints)
 	if err != nil {
 		return nil, err
+	}
+
+	// Wrap the inner operator with caching if a SubqueryCache is configured.
+	if nOpts.SubqueryCache != nil {
+		exprFingerprint := logicalplan.NodeFingerprint(t.Expr)
+		keyPrefix := fmt.Sprintf("sq:%s:%016x", nOpts.TenantID, exprFingerprint)
+		latestCached := nOpts.SubqueryCache.GetLatestTimestamp(keyPrefix)
+
+		// Build a narrow inner operator covering only the uncached portion.
+		narrowStart := nOpts.End // default: empty range (cold start uses fullInner)
+		if latestCached >= nOpts.Start.UnixMilli() {
+			narrowStart = time.UnixMilli(latestCached + nOpts.Step.Milliseconds())
+		}
+		narrowOpts := *nOpts
+		narrowOpts.Start = narrowStart
+
+		narrowHints := hints
+		narrowHints.Start = narrowStart.UnixMilli()
+
+		narrowInner, err := newOperator(ctx, t.Expr, storage, &narrowOpts, narrowHints)
+		if err != nil {
+			return nil, err
+		}
+
+		inner = scan.NewCachedSubqueryOperator(inner, narrowInner, nOpts, t.Expr)
 	}
 
 	outerOpts := *opts

@@ -98,6 +98,12 @@ type QueryOpts struct {
 
 	// LogicalOptimizers can be used to override the LogicalOptimizers engine setting.
 	LogicalOptimizers []logicalplan.Optimizer
+
+	// SubqueryCache enables caching of subquery inner step results across evaluations.
+	SubqueryCache query.SubqueryCache
+
+	// TenantID scopes cache keys to a specific tenant.
+	TenantID string
 }
 
 func (opts QueryOpts) LookbackDelta() time.Duration { return opts.LookbackDeltaParam }
@@ -106,6 +112,10 @@ func (opts QueryOpts) EnablePerStepStats() bool     { return opts.EnablePerStepS
 func fromPromQLOpts(opts promql.QueryOpts) *QueryOpts {
 	if opts == nil {
 		return &QueryOpts{}
+	}
+	// If the caller passed our QueryOpts directly, preserve all fields.
+	if qo, ok := opts.(*QueryOpts); ok {
+		return qo
 	}
 	return &QueryOpts{
 		LookbackDeltaParam:      opts.LookbackDelta(),
@@ -462,6 +472,11 @@ func (e *Engine) makeQueryOpts(start time.Time, end time.Time, step time.Duratio
 
 	if opts.DecodingConcurrency != 0 {
 		res.DecodingConcurrency = opts.DecodingConcurrency
+	}
+
+	if opts.SubqueryCache != nil {
+		res.SubqueryCache = opts.SubqueryCache
+		res.TenantID = opts.TenantID
 	}
 
 	return res

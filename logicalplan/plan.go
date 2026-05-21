@@ -25,6 +25,7 @@ var DefaultOptimizers = []Optimizer{
 	SortMatchers{},
 	MergeSelectsOptimizer{},
 	DetectHistogramStatsOptimizer{},
+	SubqueryCacheOptimizer{},
 }
 
 type Plan interface {

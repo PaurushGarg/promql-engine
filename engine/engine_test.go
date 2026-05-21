@@ -2232,12 +2232,108 @@ avg by (storage_info) (
 			    http_requests_total{pod="nginx-2", series="2"} 2+2x50`,
 			query: `sum_over_time(sum by (pod) (http_requests_total)[5m:1m])`,
 		},
+		// SubqueryCacheOptimizer correctness tests: these queries trigger the
+		// optimizer which pushes the outer aggregation inside the subquery.
+		// The rewritten plan must produce identical results to the original.
+		{
+			name: "subquery cache optimizer: sum by + avg_over_time",
+			load: `load 30s
+			    http_requests_total{pod="nginx-1", cluster="a"} 1+1x60
+			    http_requests_total{pod="nginx-2", cluster="a"} 2+2x60
+			    http_requests_total{pod="nginx-3", cluster="b"} 5+5x60`,
+			query: `sum by (cluster) (avg_over_time(http_requests_total[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: sum by + sum_over_time",
+			load: `load 30s
+			    http_requests_total{pod="nginx-1", cluster="a"} 1+1x60
+			    http_requests_total{pod="nginx-2", cluster="a"} 2+2x60
+			    http_requests_total{pod="nginx-3", cluster="b"} 5+5x60`,
+			query: `sum by (cluster) (sum_over_time(http_requests_total[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: max by + max_over_time",
+			load: `load 30s
+			    cpu_usage{host="h1", region="us"} 10+5x60
+			    cpu_usage{host="h2", region="us"} 20+3x60
+			    cpu_usage{host="h3", region="eu"} 15+4x60`,
+			query: `max by (region) (max_over_time(cpu_usage[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: min by + min_over_time",
+			load: `load 30s
+			    latency{svc="api", region="us"} 100-1x60
+			    latency{svc="web", region="us"} 200-2x60
+			    latency{svc="api", region="eu"} 150-1x60`,
+			query: `min by (region) (min_over_time(latency[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: sum by + avg_over_time with rate",
+			load: `load 30s
+			    http_requests_total{pod="nginx-1", cluster="a"} 1+1x60
+			    http_requests_total{pod="nginx-2", cluster="a"} 2+2x60
+			    http_requests_total{pod="nginx-3", cluster="b"} 5+5x60`,
+			query: `sum by (cluster) (avg_over_time(rate(http_requests_total[1m])[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: sum without + avg_over_time",
+			load: `load 30s
+			    http_requests_total{pod="nginx-1", cluster="a"} 1+1x60
+			    http_requests_total{pod="nginx-2", cluster="a"} 2+2x60
+			    http_requests_total{pod="nginx-3", cluster="b"} 5+5x60`,
+			query: `sum without (pod) (avg_over_time(http_requests_total[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: sum + avg_over_time no grouping",
+			load: `load 30s
+			    http_requests_total{pod="nginx-1"} 1+1x60
+			    http_requests_total{pod="nginx-2"} 2+2x60`,
+			query: `sum(avg_over_time(http_requests_total[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: count by + count_over_time does not commute",
+			load: `load 30s
+			    up{job="api", instance="i1"} 1+0x60
+			    up{job="api", instance="i2"} 1+0x60
+			    up{job="web", instance="i3"} 1+0x60`,
+			query: `count by (job) (count_over_time(up[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: sum by + last_over_time",
+			load: `load 30s
+			    http_requests_total{pod="nginx-1", cluster="a"} 1+1x60
+			    http_requests_total{pod="nginx-2", cluster="a"} 2+2x60
+			    http_requests_total{pod="nginx-3", cluster="b"} 5+5x60`,
+			query: `sum by (cluster) (last_over_time(http_requests_total[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: max by + last_over_time",
+			load: `load 30s
+			    cpu_usage{host="h1", region="us"} 10+5x60
+			    cpu_usage{host="h2", region="us"} 20+3x60
+			    cpu_usage{host="h3", region="eu"} 15+4x60`,
+			query: `max by (region) (last_over_time(cpu_usage[5m:1m]))`,
+		},
+		{
+			name: "subquery cache optimizer: min by + last_over_time",
+			load: `load 30s
+			    latency{svc="api", region="us"} 100-1x60
+			    latency{svc="web", region="us"} 200-2x60
+			    latency{svc="api", region="eu"} 150-1x60`,
+			query: `min by (region) (last_over_time(latency[5m:1m]))`,
+		},
 		{
 			name: "rate subquery with outer @ modifier",
 			load: `load 30s
 			    http_requests_total{pod="nginx-1", series="1"} 1+1x40
 			    http_requests_total{pod="nginx-2", series="2"} 2+2x50`,
 			query: `rate(http_requests_total[20s:10s] @ 100.000)`,
+		},
+		{
+			name: "phase2 debug: nested max_over_time subquery",
+			load: `load 30s
+			    metric{pod="a"} 1+1x200`,
+			query: `max_over_time(max_over_time(metric[10m])[30m:10m])`,
 		},
 		{
 			name: "rate subquery with offset",

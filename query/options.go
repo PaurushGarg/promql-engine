@@ -19,6 +19,8 @@ type Options struct {
 	EnableAnalysis           bool
 	DecodingConcurrency      int
 	SampleTracker            SampleTracker // Tracks current samples in memory
+	SubqueryCache            SubqueryCache // Optional cache for subquery inner step results
+	TenantID                 string        // Tenant identifier for cache key scoping
 }
 
 // TotalSteps returns the total number of steps in the query, regardless of batching.
@@ -59,6 +61,8 @@ func NestedOptionsForSubquery(opts *Options, step, queryRange, offset time.Durat
 		EnableAnalysis:           opts.EnableAnalysis,
 		DecodingConcurrency:      opts.DecodingConcurrency,
 		SampleTracker:            opts.SampleTracker,
+		SubqueryCache:            opts.SubqueryCache,
+		TenantID:                 opts.TenantID,
 	}
 	if nOpts.SampleTracker == nil {
 		nOpts.SampleTracker = NewSampleTracker(0)
