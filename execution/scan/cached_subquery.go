@@ -14,6 +14,17 @@ import (
 	"github.com/thanos-io/promql-engine/query"
 )
 
+const (
+	// minStepsToCache is the minimum number of subquery steps required to enable caching.
+	// Below this threshold, the overhead of caching outweighs the savings.
+	// Default: 2 (cache any subquery with 2+ steps). Increase for production if needed.
+	minStepsToCache int64 = 2
+
+	// maxCacheableSeriesPerStep is the maximum number of series per step that will be cached.
+	// Steps with more series than this are skipped to avoid excessive memory/cache usage.
+	maxCacheableSeriesPerStep = 10000
+)
+
 // cachedSubqueryOperator wraps the subquery's inner operator with caching.
 // It holds two inner operators:
 //   - narrowInner: covers only the uncached time range (new steps since last evaluation)
@@ -69,6 +80,13 @@ func NewCachedSubqueryOperator(
 	if step == 0 {
 		step = 1
 	}
+
+	// Skip caching if the range is too short to benefit.
+	totalSteps := (opts.End.UnixMilli() - opts.Start.UnixMilli()) / step
+	if totalSteps < minStepsToCache {
+		return fullInner
+	}
+
 	return &cachedSubqueryOperator{
 		narrowInner: narrowInner,
 		fullInner:   fullInner,
@@ -162,10 +180,15 @@ func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf
 		return n, err
 	}
 
-	// Cache newly computed steps.
+	// Cache newly computed steps (skip if cardinality too high).
 	for i := 0; i < vecN; i++ {
-		c.cache.Put(c.cacheKey(innerBuf[i].T), innerBuf[i].Samples)
+		if len(innerBuf[i].Samples) <= maxCacheableSeriesPerStep {
+			c.cache.Put(c.cacheKey(innerBuf[i].T), innerBuf[i].Samples)
+		}
 	}
+
+	// Cleanup: remove entries that have fallen out of the window.
+	c.cache.DeleteBefore(c.keyPrefix, c.mint)
 
 	return n + vecN, nil
 }
@@ -176,9 +199,11 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 		return 0, err
 	}
 
-	// Cache all produced steps for next evaluation.
+	// Cache all produced steps for next evaluation (skip if cardinality too high).
 	for i := 0; i < vecN; i++ {
-		c.cache.Put(c.cacheKey(buf[i].T), buf[i].Samples)
+		if len(buf[i].Samples) <= maxCacheableSeriesPerStep {
+			c.cache.Put(c.cacheKey(buf[i].T), buf[i].Samples)
+		}
 	}
 
 	return vecN, nil

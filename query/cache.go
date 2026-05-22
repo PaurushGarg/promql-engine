@@ -19,6 +19,9 @@ type SubqueryCache interface {
 	// GetLatestTimestamp returns the highest cached timestamp for a given key prefix.
 	// Returns -1 if no entries exist for this prefix.
 	GetLatestTimestamp(keyPrefix string) int64
+	// DeleteBefore removes all entries for a key prefix with timestamps before the given value.
+	// This prevents unbounded cache growth as the evaluation window slides forward.
+	DeleteBefore(keyPrefix string, beforeTimestamp int64)
 	// Stats returns cache statistics for observability.
 	Stats() CacheStats
 }
@@ -138,6 +141,36 @@ func (c *LocalSubqueryCache) GetLatestTimestamp(keyPrefix string) int64 {
 		return ts
 	}
 	return -1
+}
+
+func (c *LocalSubqueryCache) DeleteBefore(keyPrefix string, beforeTimestamp int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, entry := range c.store {
+		if !strings.HasPrefix(key, keyPrefix) {
+			continue
+		}
+		// Parse timestamp from key suffix.
+		lastColon := strings.LastIndex(key, ":")
+		if lastColon < 0 {
+			continue
+		}
+		var ts int64
+		for _, ch := range key[lastColon+1:] {
+			if ch >= '0' && ch <= '9' {
+				ts = ts*10 + int64(ch-'0')
+			} else if ch == '-' {
+				// negative timestamp — skip deletion for simplicity
+				ts = -1
+				break
+			}
+		}
+		if ts >= 0 && ts < beforeTimestamp {
+			c.sizeBytes -= int64(len(entry.values) * 8)
+			c.evictions++
+			delete(c.store, key)
+		}
+	}
 }
 
 func (c *LocalSubqueryCache) Stats() CacheStats {
