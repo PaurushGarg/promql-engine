@@ -6778,3 +6778,112 @@ func TestDoubleExponentialSmoothing(t *testing.T) {
 		})
 	}
 }
+
+func TestRangeVectorFunctionBatchingCorrectness(t *testing.T) {
+	t.Parallel()
+
+	load := `load 30s
+		http_requests_total{pod="nginx-1", route="/"} 100+10x100
+		http_requests_total{pod="nginx-2", route="/"} 200+20x100
+		http_requests_total{pod="nginx-3", route="/api"} 50+5x100
+		http_requests_total{pod="nginx-4", route="/api"} 150+15x100
+		http_requests_total{pod="nginx-5", route="/health"} 10+1x100
+	`
+
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "sum of rate",
+			query: `sum(rate(http_requests_total[5m]))`,
+		},
+		{
+			name:  "sum by label of rate",
+			query: `sum by (route) (rate(http_requests_total[5m]))`,
+		},
+		{
+			name:  "sum of increase",
+			query: `sum(increase(http_requests_total[5m]))`,
+		},
+		{
+			name:  "max of rate",
+			query: `max by (pod) (rate(http_requests_total[5m]))`,
+		},
+		{
+			name:  "avg of present_over_time",
+			query: `avg(present_over_time(http_requests_total[10m]))`,
+		},
+		{
+			name:  "count of changes",
+			query: `count(changes(http_requests_total[5m]))`,
+		},
+		{
+			name:  "sum of irate",
+			query: `sum(irate(http_requests_total[5m]))`,
+		},
+		{
+			name:  "sum of delta",
+			query: `sum(delta(http_requests_total[5m]))`,
+		},
+		{
+			name:  "nested aggregation with rate",
+			query: `max by (route) (sum by (route, pod) (rate(http_requests_total[5m])))`,
+		},
+		{
+			name:  "sum of avg_over_time",
+			query: `sum(avg_over_time(http_requests_total[10m]))`,
+		},
+		{
+			name:  "sum of count_over_time",
+			query: `sum(count_over_time(http_requests_total[5m]))`,
+		},
+		{
+			name:  "sum of last_over_time",
+			query: `sum(last_over_time(http_requests_total[5m]))`,
+		},
+	}
+
+	opts := promql.EngineOpts{
+		Timeout:              1 * time.Hour,
+		MaxSamples:           1e10,
+		EnableNegativeOffset: true,
+		EnableAtModifier:     true,
+	}
+
+	start := time.Unix(300, 0)
+	end := time.Unix(3000, 0)
+	step := 30 * time.Second
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+
+			storage := promqltest.LoadedStorage(t, load)
+			defer storage.Close()
+
+			// Prometheus engine
+			oldEngine := promql.NewEngine(opts)
+			q1, err := oldEngine.NewRangeQuery(ctx, storage, nil, tc.query, start, end, step)
+			testutil.Ok(t, err)
+			defer q1.Close()
+			oldResult := q1.Exec(ctx)
+			testutil.Ok(t, oldResult.Err)
+
+			// Thanos engine with SelectorBatchSize=2
+			newEngine := engine.New(engine.Opts{
+				EngineOpts:        opts,
+				SelectorBatchSize: 2,
+			})
+			q2, err := newEngine.NewRangeQuery(ctx, storage, nil, tc.query, start, end, step)
+			testutil.Ok(t, err)
+			defer q2.Close()
+			newResult := q2.Exec(ctx)
+			testutil.Ok(t, newResult.Err)
+
+			testutil.WithGoCmp(comparer).Equals(t, oldResult, newResult, queryExplanation(q2))
+		})
+	}
+}
+

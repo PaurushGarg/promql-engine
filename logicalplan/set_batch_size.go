@@ -25,10 +25,9 @@ func (m SelectorBatchSize) Optimize(plan Node, _ *query.Options) (Node, annotati
 	Traverse(&plan, func(current *Node) {
 		switch e := (*current).(type) {
 		case *FunctionCall:
-			//TODO: calls can reduce the labelset of the input; think histogram_quantile reducing
-			// multiple "le" labels into one output. We cannot handle this in batching. Revisit
-			// what is safe here.
-			canBatch = false
+			if !isRangeVectorFunction(e) {
+				canBatch = false
+			}
 		case *Binary:
 			canBatch = false
 		case *Aggregation:
@@ -45,4 +44,14 @@ func (m SelectorBatchSize) Optimize(plan Node, _ *query.Options) (Node, annotati
 		}
 	})
 	return plan, nil
+}
+
+func isRangeVectorFunction(f *FunctionCall) bool {
+	for _, arg := range f.Args {
+		switch arg.(type) {
+		case *MatrixSelector, *Subquery:
+			return true
+		}
+	}
+	return false
 }

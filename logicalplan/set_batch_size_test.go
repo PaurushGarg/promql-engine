@@ -88,6 +88,31 @@ func TestSetBatchSize(t *testing.T) {
 			expr:     `histogram_quantile(scalar(max(quantile)), http_requests_total)`,
 			expected: `histogram_quantile(scalar(max(quantile[batch=10])), http_requests_total)`,
 		},
+		{
+			name:     "aggregation of range vector function (rate)",
+			expr:     `sum(rate(http_requests_total[5m]))`,
+			expected: `sum(rate(http_requests_total[batch=10][5m0s]))`,
+		},
+		{
+			name:     "aggregation of range vector function (increase)",
+			expr:     `sum(increase(http_requests_total[5m]))`,
+			expected: `sum(increase(http_requests_total[batch=10][5m0s]))`,
+		},
+		{
+			name:     "aggregation of range vector function (present_over_time)",
+			expr:     `sum(present_over_time(http_requests_total[1h]))`,
+			expected: `sum(present_over_time(http_requests_total[batch=10][1h0m0s]))`,
+		},
+		{
+			name:     "nested aggregation with range vector function",
+			expr:     `max by (pod) (sum by (pod) (rate(http_requests_total[5m])))`,
+			expected: `max by (pod) (sum by (pod) (rate(http_requests_total[batch=10][5m0s])))`,
+		},
+		{
+			name:     "histogram_quantile does not allow batching",
+			expr:     `sum(histogram_quantile(0.9, rate(http_requests_total[5m])))`,
+			expected: `sum(histogram_quantile(0.9, rate(http_requests_total[5m0s])))`,
+		},
 	}
 
 	optimizers := append([]Optimizer{SelectorBatchSize{Size: 10}}, DefaultOptimizers...)
