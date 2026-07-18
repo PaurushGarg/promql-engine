@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"sync"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -45,6 +46,7 @@ type cachedSubqueryOperator struct {
 	narrowInner model.VectorOperator
 	fullInner   model.VectorOperator
 	cache       query.SubqueryCache
+	logger      *slog.Logger
 
 	keyPrefix string
 	mint      int64
@@ -116,6 +118,7 @@ func NewCachedSubqueryOperator(
 		narrowInner: narrowInner,
 		fullInner:   fullInner,
 		cache:       opts.SubqueryCache,
+		logger:      opts.Logger,
 		keyPrefix:   fmt.Sprintf("sq:%s:%016x", opts.TenantID, logicalplan.NodeFingerprint(innerExpr)),
 		mint:        opts.Start.UnixMilli(),
 		maxt:        opts.End.UnixMilli(),
@@ -167,6 +170,7 @@ func (c *cachedSubqueryOperator) decide() {
 	if cachedHashData == nil || len(cachedHashData) < 8 {
 		// No cached series hash means no valid cache data exists.
 		c.useCache = false
+		c.log("subquery cache: cold start", "reason", "no_series_hash")
 		return
 	}
 
@@ -174,6 +178,7 @@ func (c *cachedSubqueryOperator) decide() {
 	series, err := c.fullInner.Series(context.Background())
 	if err != nil {
 		c.useCache = false
+		c.log("subquery cache: cold start", "reason", "series_error", "err", err)
 		return
 	}
 	currentHash := seriesSetHash(series)
@@ -182,6 +187,8 @@ func (c *cachedSubqueryOperator) decide() {
 	if currentHash != cachedHash {
 		// Series set changed (churn) — invalidate and cold start.
 		c.useCache = false
+		c.log("subquery cache: invalidated", "reason", "series_changed",
+			"cached_hash", cachedHash, "current_hash", currentHash, "series_count", len(series))
 		return
 	}
 
@@ -207,6 +214,15 @@ func (c *cachedSubqueryOperator) decide() {
 	}
 	// Use cache path if we have at least one cached step.
 	c.useCache = len(c.cachedSteps) > 0
+
+	if c.useCache {
+		totalSteps := len(keys)
+		c.log("subquery cache: warm path",
+			"cached_steps", len(c.cachedSteps), "total_steps", totalSteps,
+			"new_steps", totalSteps-len(c.cachedSteps), "series_count", len(series))
+	} else {
+		c.log("subquery cache: cold start", "reason", "no_cached_steps")
+	}
 }
 
 func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf []model.StepVector) (int, error) {
@@ -278,6 +294,8 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 	}
 
 	// Cache all produced steps for next evaluation (skip if cardinality too high).
+	cachedCount := 0
+	var totalSize int
 	for i := 0; i < vecN; i++ {
 		totalSeries := len(buf[i].Samples) + len(buf[i].Histograms)
 		if totalSeries <= maxCacheableSeriesPerStep {
@@ -287,7 +305,10 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 				HistogramIDs: buf[i].HistogramIDs,
 				Histograms:   buf[i].Histograms,
 			}
-			c.cache.Put(c.cacheKey(buf[i].T), query.EncodeStepData(stepData))
+			encoded := query.EncodeStepData(stepData)
+			c.cache.Put(c.cacheKey(buf[i].T), encoded)
+			cachedCount++
+			totalSize += len(encoded)
 		}
 	}
 
@@ -307,6 +328,10 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 		c.cache.Put(c.latestTimestampKey(), tsBytes[:])
 	}
 
+	c.log("subquery cache: populated (cold)",
+		"steps_cached", cachedCount, "total_bytes", totalSize,
+		"series_count", len(series))
+
 	return vecN, nil
 }
 
@@ -321,4 +346,11 @@ func (c *cachedSubqueryOperator) seriesHashKey() string {
 
 func (c *cachedSubqueryOperator) latestTimestampKey() string {
 	return "meta:" + c.keyPrefix + ":latest_ts"
+}
+
+// log emits a debug-level log message if a logger is configured.
+func (c *cachedSubqueryOperator) log(msg string, args ...any) {
+	if c.logger != nil {
+		c.logger.Debug(msg, append([]any{"key_prefix", c.keyPrefix}, args...)...)
+	}
 }

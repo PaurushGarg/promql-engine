@@ -4,6 +4,7 @@
 package query
 
 import (
+	"log/slog"
 	"time"
 )
 
@@ -21,6 +22,7 @@ type Options struct {
 	SampleTracker            SampleTracker // Tracks current samples in memory
 	SubqueryCache            SubqueryCache // Optional cache for subquery inner step results
 	TenantID                 string        // Tenant identifier for cache key scoping
+	Logger                   *slog.Logger  // Optional logger for cache diagnostics
 }
 
 // TotalSteps returns the total number of steps in the query, regardless of batching.
@@ -63,6 +65,7 @@ func NestedOptionsForSubquery(opts *Options, step, queryRange, offset time.Durat
 		SampleTracker:            opts.SampleTracker,
 		SubqueryCache:            opts.SubqueryCache,
 		TenantID:                 opts.TenantID,
+		Logger:                   opts.Logger,
 	}
 	if nOpts.SampleTracker == nil {
 		nOpts.SampleTracker = NewSampleTracker(0)
