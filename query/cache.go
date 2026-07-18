@@ -5,7 +5,6 @@ package query
 
 import (
 	"sync"
-	"time"
 )
 
 // SubqueryCache is the interface for caching subquery inner step results.
@@ -111,56 +110,4 @@ func (c *MockSubqueryCache) Stats() CacheStats {
 	}
 }
 
-// --- Legacy LocalSubqueryCache (kept for backward compatibility during migration) ---
-// TODO: Remove once all callers are migrated to the new []byte interface.
-
-// LocalSubqueryCacheConfig configures the local cache.
-type LocalSubqueryCacheConfig struct {
-	MaxSizeBytes int64         // Upper bound on total cache size. 0 = unlimited.
-	TTL          time.Duration // Entries older than TTL are evicted. 0 = no expiry.
-}
-
-// LocalSubqueryCache wraps MockSubqueryCache with the legacy []float64 interface.
-// Used only by tests that haven't been migrated yet.
-type LocalSubqueryCache struct {
-	mock   *MockSubqueryCache
-	config LocalSubqueryCacheConfig
-}
-
-func NewLocalSubqueryCache() *LocalSubqueryCache {
-	return NewLocalSubqueryCacheWithConfig(LocalSubqueryCacheConfig{
-		MaxSizeBytes: 2 * 1024 * 1024 * 1024, // 2GB default
-		TTL:          3 * 24 * time.Hour,      // 3 days default
-	})
-}
-
-func NewLocalSubqueryCacheWithConfig(cfg LocalSubqueryCacheConfig) *LocalSubqueryCache {
-	return &LocalSubqueryCache{
-		mock:   NewMockSubqueryCache(),
-		config: cfg,
-	}
-}
-
-// Get delegates to the underlying mock.
-func (c *LocalSubqueryCache) Get(key string) []byte {
-	return c.mock.Get(key)
-}
-
-// GetMulti delegates to the underlying mock.
-func (c *LocalSubqueryCache) GetMulti(keys []string) map[string][]byte {
-	return c.mock.GetMulti(keys)
-}
-
-// Put delegates to the underlying mock.
-func (c *LocalSubqueryCache) Put(key string, value []byte) {
-	c.mock.Put(key, value)
-}
-
-// Delete delegates to the underlying mock.
-func (c *LocalSubqueryCache) Delete(key string) {
-	c.mock.Delete(key)
-}
-
-func (c *LocalSubqueryCache) Stats() CacheStats {
-	return c.mock.Stats()
-}
+// --- End of cache implementation ---

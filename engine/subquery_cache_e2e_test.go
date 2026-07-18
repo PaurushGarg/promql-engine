@@ -47,7 +47,7 @@ func TestSubqueryCacheEndToEnd(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Reset cache for each test case.
-			testCache := query.NewLocalSubqueryCache()
+			testCache := query.NewMockSubqueryCache()
 
 			opts := promql.EngineOpts{
 				Timeout:    time.Hour,

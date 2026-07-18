@@ -12,7 +12,7 @@ import (
 )
 
 func TestRangeToSubqueryOptimizer(t *testing.T) {
-	cache := query.NewLocalSubqueryCache()
+	cache := query.NewMockSubqueryCache()
 	opts := &query.Options{
 		SubqueryCache: cache,
 		TenantID:      "test",

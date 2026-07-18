@@ -46,7 +46,7 @@ func (m *mockInnerOperator) Explain() []model.VectorOperator { return nil }
 func (m *mockInnerOperator) String() string                  { return "mockInner" }
 
 func TestCachedSubqueryOperator_ColdStart(t *testing.T) {
-	cache := query.NewLocalSubqueryCache()
+	cache := query.NewMockSubqueryCache()
 	innerExpr := &logicalplan.NumberLiteral{Val: 42}
 
 	fullInner := &mockInnerOperator{
@@ -94,7 +94,7 @@ func TestCachedSubqueryOperator_ColdStart(t *testing.T) {
 }
 
 func TestCachedSubqueryOperator_WarmCache(t *testing.T) {
-	cache := query.NewLocalSubqueryCache()
+	cache := query.NewMockSubqueryCache()
 	innerExpr := &logicalplan.NumberLiteral{Val: 42}
 	keyPrefix := fmt.Sprintf("sq:tenant1:%016x", logicalplan.NodeFingerprint(innerExpr))
 
@@ -181,7 +181,7 @@ func TestCachedSubqueryOperator_NilCache(t *testing.T) {
 // 2. Warm evaluation (cache hit + narrow inner for new step)
 // 3. Delayed evaluation (cache hit + narrow inner for multiple new steps)
 func TestCachedSubqueryOperator_RulerSimulation(t *testing.T) {
-	cache := query.NewLocalSubqueryCache()
+	cache := query.NewMockSubqueryCache()
 	innerExpr := &logicalplan.NumberLiteral{Val: 99}
 	keyPrefix := fmt.Sprintf("sq:tenant1:%016x", logicalplan.NodeFingerprint(innerExpr))
 
