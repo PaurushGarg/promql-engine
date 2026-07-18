@@ -5,7 +5,10 @@ package scan
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
+	"math"
 	"sync"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -34,6 +37,11 @@ const (
 // If cache has data from a previous evaluation, it serves cached steps first,
 // then delegates to narrowInner for new steps.
 // If cache is empty (cold start), it delegates entirely to fullInner and caches results.
+//
+// Series validation: On each evaluation, the operator computes a hash of the current
+// series set and compares it against the cached series hash. If they differ (series
+// churn: pods added/removed), the cache is invalidated and a cold start is performed.
+// This prevents incorrect results from positional mismatch.
 type cachedSubqueryOperator struct {
 	narrowInner model.VectorOperator
 	fullInner   model.VectorOperator
@@ -58,6 +66,24 @@ type cachedSubqueryOperator struct {
 
 	// Track whether we've exhausted cached steps and switched to narrowInner.
 	servingFromNarrow bool
+}
+
+// seriesSetHash computes a stable hash over the full series set.
+// The hash captures both the set membership and ordering of series.
+// If the series set changes between evaluations (pods added/removed/reordered),
+// this hash will differ, triggering cache invalidation.
+func seriesSetHash(series []labels.Labels) uint64 {
+	h := fnv.New64a()
+	var buf [8]byte
+	for i, s := range series {
+		// Include position to detect reordering.
+		binary.LittleEndian.PutUint64(buf[:], uint64(i))
+		h.Write(buf[:])
+		// Include the series labels hash.
+		binary.LittleEndian.PutUint64(buf[:], s.Hash())
+		h.Write(buf[:])
+	}
+	return h.Sum64()
 }
 
 type cachedStepEntry struct {
@@ -136,7 +162,31 @@ func (c *cachedSubqueryOperator) Next(ctx context.Context, buf []model.StepVecto
 }
 
 func (c *cachedSubqueryOperator) decide() {
-	// Load all cached steps for our range.
+	// First, validate that the series set hasn't changed since data was cached.
+	// If it has, the positional cache entries are invalid — fall back to cold start.
+	cachedHashSlice := c.cache.Get(c.seriesHashKey())
+	if cachedHashSlice == nil || len(cachedHashSlice) != 1 {
+		// No cached series hash means no valid cache data exists.
+		c.useCache = false
+		return
+	}
+
+	// Compute current series hash.
+	series, err := c.fullInner.Series(context.Background())
+	if err != nil {
+		c.useCache = false
+		return
+	}
+	currentHash := seriesSetHash(series)
+	cachedHash := math.Float64bits(cachedHashSlice[0])
+
+	if currentHash != cachedHash {
+		// Series set changed (churn) — invalidate and cold start.
+		c.useCache = false
+		return
+	}
+
+	// Series set matches. Load cached steps for our range.
 	for t := c.mint; t <= c.maxt; t += c.step {
 		key := c.cacheKey(t)
 		if vals := c.cache.Get(key); vals != nil {
@@ -206,9 +256,24 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 		}
 	}
 
+	// Store the series hash so the next evaluation can validate the series set.
+	// This is called on cold start, so we compute and store the hash once.
+	series, seriesErr := c.fullInner.Series(ctx)
+	if seriesErr == nil && len(series) > 0 {
+		hash := seriesSetHash(series)
+		c.cache.Put(c.seriesHashKey(), []float64{math.Float64frombits(hash)})
+	}
+
 	return vecN, nil
 }
 
 func (c *cachedSubqueryOperator) cacheKey(timestamp int64) string {
 	return fmt.Sprintf("%s:%d", c.keyPrefix, timestamp)
+}
+
+func (c *cachedSubqueryOperator) seriesHashKey() string {
+	// Use "meta:" prefix to distinguish from step keys (which use the keyPrefix directly).
+	// This prevents DeleteBefore from accidentally evicting the series hash,
+	// since DeleteBefore only targets keys starting with c.keyPrefix.
+	return "meta:" + c.keyPrefix + ":series_hash"
 }

@@ -6,6 +6,7 @@ package scan
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -100,6 +101,10 @@ func TestCachedSubqueryOperator_WarmCache(t *testing.T) {
 	// Pre-populate cache (simulating previous evaluation).
 	cache.Put(keyPrefix+":2000", []float64{3.0, 4.0})
 	cache.Put(keyPrefix+":3000", []float64{5.0, 6.0})
+
+	// Pre-populate series hash for the series set used by the mock operators.
+	mockSeries := []labels.Labels{labels.FromStrings("a", "1")}
+	cache.Put("meta:"+keyPrefix+":series_hash", []float64{math.Float64frombits(seriesSetHash(mockSeries))})
 
 	// This evaluation needs steps [2000, 3000, 4000].
 	// Steps 2000, 3000 are cached. Step 4000 is new.
