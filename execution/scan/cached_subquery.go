@@ -348,9 +348,11 @@ func (c *cachedSubqueryOperator) latestTimestampKey() string {
 	return "meta:" + c.keyPrefix + ":latest_ts"
 }
 
-// log emits a debug-level log message if a logger is configured.
+// log emits an info-level log message if a logger is configured.
+// NOTE: This is Info level for beta testing visibility. For production PR,
+// either remove logging or switch to Debug level.
 func (c *cachedSubqueryOperator) log(msg string, args ...any) {
 	if c.logger != nil {
-		c.logger.Debug(msg, append([]any{"key_prefix", c.keyPrefix}, args...)...)
+		c.logger.Info(msg, append([]any{"key_prefix", c.keyPrefix}, args...)...)
 	}
 }
