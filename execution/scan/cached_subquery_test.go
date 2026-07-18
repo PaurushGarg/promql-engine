@@ -99,8 +99,12 @@ func TestCachedSubqueryOperator_WarmCache(t *testing.T) {
 	keyPrefix := fmt.Sprintf("sq:tenant1:%016x", logicalplan.NodeFingerprint(innerExpr))
 
 	// Pre-populate cache (simulating previous evaluation).
-	cache.Put(keyPrefix+":2000", query.EncodeFloats([]float64{3.0, 4.0}))
-	cache.Put(keyPrefix+":3000", query.EncodeFloats([]float64{5.0, 6.0}))
+	cache.Put(keyPrefix+":2000", query.EncodeStepData(&query.StepData{
+		SampleIDs: []uint64{0, 1}, Samples: []float64{3.0, 4.0},
+	}))
+	cache.Put(keyPrefix+":3000", query.EncodeStepData(&query.StepData{
+		SampleIDs: []uint64{0, 1}, Samples: []float64{5.0, 6.0},
+	}))
 
 	// Pre-populate series hash for the series set used by the mock operators.
 	mockSeries := []labels.Labels{labels.FromStrings("a", "1")}

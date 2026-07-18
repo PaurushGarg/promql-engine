@@ -86,8 +86,8 @@ func seriesSetHash(series []labels.Labels) uint64 {
 }
 
 type cachedStepEntry struct {
-	t       int64
-	samples []float64
+	t    int64
+	data *query.StepData
 }
 
 // NewCachedSubqueryOperator creates a cached operator with both narrow and full inner operators.
@@ -198,12 +198,12 @@ func (c *cachedSubqueryOperator) decide() {
 		if !ok || data == nil {
 			break
 		}
-		vals := query.DecodeFloats(data)
-		if vals == nil {
+		stepData := query.DecodeStepData(data)
+		if stepData == nil {
 			break
 		}
 		t := c.mint + int64(i)*c.step
-		c.cachedSteps = append(c.cachedSteps, cachedStepEntry{t: t, samples: vals})
+		c.cachedSteps = append(c.cachedSteps, cachedStepEntry{t: t, data: stepData})
 	}
 	// Use cache path if we have at least one cached step.
 	c.useCache = len(c.cachedSteps) > 0
@@ -216,11 +216,14 @@ func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf
 	for n < len(buf) && c.cacheIdx < len(c.cachedSteps) {
 		entry := c.cachedSteps[c.cacheIdx]
 		buf[n].Reset(entry.t)
-		ids := make([]uint64, len(entry.samples))
-		for j := range ids {
-			ids[j] = uint64(j)
+		// Restore float samples.
+		if len(entry.data.Samples) > 0 {
+			buf[n].AppendSamples(entry.data.SampleIDs, entry.data.Samples)
 		}
-		buf[n].AppendSamples(ids, entry.samples)
+		// Restore histograms.
+		if len(entry.data.Histograms) > 0 {
+			buf[n].AppendHistograms(entry.data.HistogramIDs, entry.data.Histograms)
+		}
 		n++
 		c.cacheIdx++
 	}
@@ -241,8 +244,15 @@ func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf
 
 	// Cache newly computed steps (skip if cardinality too high).
 	for i := 0; i < vecN; i++ {
-		if len(innerBuf[i].Samples) <= maxCacheableSeriesPerStep {
-			c.cache.Put(c.cacheKey(innerBuf[i].T), query.EncodeFloats(innerBuf[i].Samples))
+		totalSeries := len(innerBuf[i].Samples) + len(innerBuf[i].Histograms)
+		if totalSeries <= maxCacheableSeriesPerStep {
+			stepData := &query.StepData{
+				SampleIDs:    innerBuf[i].SampleIDs,
+				Samples:      innerBuf[i].Samples,
+				HistogramIDs: innerBuf[i].HistogramIDs,
+				Histograms:   innerBuf[i].Histograms,
+			}
+			c.cache.Put(c.cacheKey(innerBuf[i].T), query.EncodeStepData(stepData))
 		}
 	}
 
@@ -269,8 +279,15 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 
 	// Cache all produced steps for next evaluation (skip if cardinality too high).
 	for i := 0; i < vecN; i++ {
-		if len(buf[i].Samples) <= maxCacheableSeriesPerStep {
-			c.cache.Put(c.cacheKey(buf[i].T), query.EncodeFloats(buf[i].Samples))
+		totalSeries := len(buf[i].Samples) + len(buf[i].Histograms)
+		if totalSeries <= maxCacheableSeriesPerStep {
+			stepData := &query.StepData{
+				SampleIDs:    buf[i].SampleIDs,
+				Samples:      buf[i].Samples,
+				HistogramIDs: buf[i].HistogramIDs,
+				Histograms:   buf[i].Histograms,
+			}
+			c.cache.Put(c.cacheKey(buf[i].T), query.EncodeStepData(stepData))
 		}
 	}
 
