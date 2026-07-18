@@ -6,6 +6,7 @@ package logicalplan
 import (
 	"time"
 
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/thanos-io/promql-engine/query"
 
 	"github.com/prometheus/prometheus/util/annotations"
@@ -76,39 +77,61 @@ func tryRangeToSubquery(funcCall *FunctionCall, chunkSize time.Duration) Node {
 		return nil
 	}
 
-	return &ChunkedRangeSelector{
-		VectorSelector: matrix.VectorSelector,
-		Range:          matrix.Range,
-		ChunkSize:      chunkSize,
-		Func:           funcCall.Func,
-		MergeOp:        decomp.mergeOp,
-		OriginalString: funcCall.String(),
+	// Build: outerFunc(innerFunc(metric[chunk])[range:chunk])
+	innerMatrix := &MatrixSelector{
+		VectorSelector: matrix.VectorSelector.Clone().(*VectorSelector),
+		Range:          chunkSize,
+		OriginalString: matrix.VectorSelector.String() + "[" + chunkSize.String() + "]",
 	}
+	innerFunc := &FunctionCall{
+		Func: parser.Function{Name: decomp.innerFunc},
+		Args: []Node{innerMatrix},
+	}
+	if f, exists := parser.Functions[decomp.innerFunc]; exists {
+		innerFunc.Func = *f
+	}
+
+	subq := &Subquery{
+		Expr:  innerFunc,
+		Range: matrix.Range,
+		Step:  chunkSize,
+	}
+
+	outerFunc := &FunctionCall{
+		Func: funcCall.Func,
+		Args: []Node{subq},
+	}
+	if decomp.outerFunc != funcCall.Func.Name {
+		if f, exists := parser.Functions[decomp.outerFunc]; exists {
+			outerFunc.Func = *f
+		}
+	}
+
+	return outerFunc
 }
 
 type decompositionRule struct {
 	innerFunc string // function applied per chunk
-	outerFunc string // function applied over chunk results (unused now, kept for reference)
-	mergeOp   string // how to merge chunk results: "max", "min", "sum"
+	outerFunc string // function applied over chunk results
 }
 
 // decomposition returns the decomposition rule for a function, or nil if not decomposable.
 func decomposition(funcName string) *decompositionRule {
 	switch funcName {
 	case "max_over_time":
-		return &decompositionRule{innerFunc: "max_over_time", outerFunc: "max_over_time", mergeOp: "max"}
+		return &decompositionRule{innerFunc: "max_over_time", outerFunc: "max_over_time"}
 	case "min_over_time":
-		return &decompositionRule{innerFunc: "min_over_time", outerFunc: "min_over_time", mergeOp: "min"}
+		return &decompositionRule{innerFunc: "min_over_time", outerFunc: "min_over_time"}
 	case "sum_over_time":
-		return &decompositionRule{innerFunc: "sum_over_time", outerFunc: "sum_over_time", mergeOp: "sum"}
+		return &decompositionRule{innerFunc: "sum_over_time", outerFunc: "sum_over_time"}
 	case "avg_over_time":
-		return &decompositionRule{innerFunc: "avg_over_time", outerFunc: "avg_over_time", mergeOp: "avg"}
+		return &decompositionRule{innerFunc: "avg_over_time", outerFunc: "avg_over_time"}
 	case "count_over_time":
-		return &decompositionRule{innerFunc: "count_over_time", outerFunc: "sum_over_time", mergeOp: "sum"}
+		return &decompositionRule{innerFunc: "count_over_time", outerFunc: "sum_over_time"}
 	case "last_over_time":
-		return &decompositionRule{innerFunc: "last_over_time", outerFunc: "last_over_time", mergeOp: "last"}
+		return &decompositionRule{innerFunc: "last_over_time", outerFunc: "last_over_time"}
 	case "present_over_time":
-		return &decompositionRule{innerFunc: "present_over_time", outerFunc: "max_over_time", mergeOp: "max"}
+		return &decompositionRule{innerFunc: "present_over_time", outerFunc: "max_over_time"}
 	}
 	return nil
 }

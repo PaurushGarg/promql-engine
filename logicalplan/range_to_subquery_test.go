@@ -19,44 +19,52 @@ func TestRangeToSubqueryOptimizer(t *testing.T) {
 	}
 
 	cases := []struct {
-		name    string
-		input   string
-		rewrite bool // whether optimizer should fire
+		name     string
+		input    string
+		expected string
+		rewrite  bool // whether optimizer should fire
 	}{
 		{
-			name:    "max_over_time 30m",
-			input:   `max_over_time(metric[30m])`,
-			rewrite: true,
+			name:     "max_over_time 30m",
+			input:    `max_over_time(metric[30m])`,
+			expected: `max_over_time(max_over_time(metric[1m0s])[30m:1m])`,
+			rewrite:  true,
 		},
 		{
-			name:    "min_over_time 1h",
-			input:   `min_over_time(metric[1h])`,
-			rewrite: true,
+			name:     "min_over_time 1h",
+			input:    `min_over_time(metric[1h])`,
+			expected: `min_over_time(min_over_time(metric[1m0s])[1h:1m])`,
+			rewrite:  true,
 		},
 		{
-			name:    "sum_over_time 30m",
-			input:   `sum_over_time(metric[30m])`,
-			rewrite: true,
+			name:     "sum_over_time 30m",
+			input:    `sum_over_time(metric[30m])`,
+			expected: `sum_over_time(sum_over_time(metric[1m0s])[30m:1m])`,
+			rewrite:  true,
 		},
 		{
-			name:    "count_over_time 30m (outer becomes sum_over_time)",
-			input:   `count_over_time(metric[30m])`,
-			rewrite: true,
+			name:     "count_over_time 30m (outer becomes sum_over_time)",
+			input:    `count_over_time(metric[30m])`,
+			expected: `sum_over_time(count_over_time(metric[1m0s])[30m:1m])`,
+			rewrite:  true,
 		},
 		{
-			name:    "range too small - no rewrite",
-			input:   `max_over_time(metric[1m])`,
-			rewrite: false,
+			name:     "range too small - no rewrite",
+			input:    `max_over_time(metric[1m])`,
+			expected: `max_over_time(metric[1m])`,
+			rewrite:  false,
 		},
 		{
-			name:    "rate - not decomposable",
-			input:   `rate(metric[30m])`,
-			rewrite: false,
+			name:     "rate - not decomposable",
+			input:    `rate(metric[30m])`,
+			expected: `rate(metric[30m])`,
+			rewrite:  false,
 		},
 		{
-			name:    "no cache - no rewrite",
-			input:   `max_over_time(metric[30m])`,
-			rewrite: false,
+			name:     "no cache - no rewrite",
+			input:    `max_over_time(metric[30m])`,
+			expected: `max_over_time(metric[30m])`,
+			rewrite:  false,
 		},
 	}
 
@@ -77,13 +85,8 @@ func TestRangeToSubqueryOptimizer(t *testing.T) {
 
 			optimized, _ := optimizer.Optimize(plan, testOpts)
 			t.Logf("Input:  %s", tc.input)
-			t.Logf("Output: %s (type: %s)", optimized.String(), optimized.Type())
-
-			if tc.rewrite {
-				testutil.Equals(t, ChunkedRangeSelectorNode, optimized.Type())
-			} else {
-				testutil.Assert(t, optimized.Type() != ChunkedRangeSelectorNode, "should not be rewritten")
-			}
+			t.Logf("Output: %s", optimized.String())
+			testutil.Equals(t, tc.expected, optimized.String())
 		})
 	}
 }

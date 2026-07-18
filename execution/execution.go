@@ -68,8 +68,6 @@ func newOperator(ctx context.Context, expr logicalplan.Node, storage storage.Sca
 		return newBinaryExpression(ctx, e, storage, opts, hints)
 	case *logicalplan.Parens:
 		return newOperator(ctx, e.Expr, storage, opts, hints)
-	case *logicalplan.ChunkedRangeSelector:
-		return function.NewChunkedRangeOperator(e, opts, storage, hints), nil
 	case *logicalplan.Unary:
 		return newUnaryExpression(ctx, e, storage, opts, hints)
 	case *logicalplan.StepInvariantExpr:

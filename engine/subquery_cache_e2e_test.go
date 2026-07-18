@@ -42,19 +42,6 @@ func TestSubqueryCacheEndToEnd(t *testing.T) {
 			name:  "avg_over_time with inner aggregation (cache only, no optimizer)",
 			query: `avg_over_time(sum by (cluster) (http_requests_total)[3m:30s])`,
 		},
-		// Phase 2: ChunkedRangeOperator with caching.
-		{
-			name:  "phase2: max_over_time plain range with cache",
-			query: `max_over_time(http_requests_total[30m])`,
-		},
-		{
-			name:  "phase2: sum_over_time plain range with cache",
-			query: `sum_over_time(http_requests_total[30m])`,
-		},
-		{
-			name:  "phase2: max by + max_over_time with cache",
-			query: `max by (cluster) (max_over_time(http_requests_total[30m]))`,
-		},
 	}
 
 	for _, tc := range cases {
