@@ -4,36 +4,115 @@
 package query
 
 import (
-	"strings"
 	"sync"
 	"time"
 )
 
 // SubqueryCache is the interface for caching subquery inner step results.
-// For POC, use NewLocalSubqueryCache(). For production, implement with memcached/Redis.
+// The cache stores raw bytes — serialization is handled by the caller.
+// This allows caching both float samples and native histograms.
+//
+// For production, implement with memcached (or any distributed cache).
+// For tests, use NewMockSubqueryCache().
 type SubqueryCache interface {
-	// Get retrieves a cached step result. Returns nil if not found.
-	Get(key string) []float64
-	// Put stores a step result.
-	Put(key string, values []float64)
-	// GetLatestTimestamp returns the highest cached timestamp for a given key prefix.
-	// Returns -1 if no entries exist for this prefix.
-	GetLatestTimestamp(keyPrefix string) int64
-	// DeleteBefore removes all entries for a key prefix with timestamps before the given value.
-	// This prevents unbounded cache growth as the evaluation window slides forward.
-	DeleteBefore(keyPrefix string, beforeTimestamp int64)
+	// Get retrieves a cached entry by key. Returns nil if not found or expired.
+	Get(key string) []byte
+	// GetMulti retrieves multiple entries in a single round trip.
+	// Returns a map of found keys to their values. Missing keys are absent from the map.
+	GetMulti(keys []string) map[string][]byte
+	// Put stores an entry with the given key. The cache implementation may apply
+	// a TTL as a safety net, but callers should use explicit Delete for eviction.
+	Put(key string, value []byte)
+	// Delete removes a specific key from the cache.
+	Delete(key string)
 	// Stats returns cache statistics for observability.
 	Stats() CacheStats
 }
 
 // CacheStats holds observability data about cache usage.
 type CacheStats struct {
-	Entries    int
-	SizeBytes  int64
-	Hits       int64
-	Misses     int64
-	Evictions  int64
+	Entries   int
+	SizeBytes int64
+	Hits      int64
+	Misses    int64
+	Evictions int64
 }
+
+// MockSubqueryCache is a simple in-memory cache for unit tests.
+// It implements SubqueryCache with no TTL, no size limits, and no network.
+type MockSubqueryCache struct {
+	mu    sync.RWMutex
+	store map[string][]byte
+
+	// Stats.
+	hits    int64
+	misses  int64
+}
+
+func NewMockSubqueryCache() *MockSubqueryCache {
+	return &MockSubqueryCache{
+		store: make(map[string][]byte),
+	}
+}
+
+func (c *MockSubqueryCache) Get(key string) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.store[key]
+	if !ok {
+		c.misses++
+		return nil
+	}
+	c.hits++
+	return entry
+}
+
+func (c *MockSubqueryCache) GetMulti(keys []string) map[string][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[string][]byte, len(keys))
+	for _, key := range keys {
+		if entry, ok := c.store[key]; ok {
+			c.hits++
+			result[key] = entry
+		} else {
+			c.misses++
+		}
+	}
+	return result
+}
+
+func (c *MockSubqueryCache) Put(key string, value []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	c.store[key] = cp
+}
+
+func (c *MockSubqueryCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.store, key)
+}
+
+func (c *MockSubqueryCache) Stats() CacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var size int64
+	for _, v := range c.store {
+		size += int64(len(v))
+	}
+	return CacheStats{
+		Entries:   len(c.store),
+		SizeBytes: size,
+		Hits:      c.hits,
+		Misses:    c.misses,
+	}
+}
+
+// --- Legacy LocalSubqueryCache (kept for backward compatibility during migration) ---
+// TODO: Remove once all callers are migrated to the new []byte interface.
 
 // LocalSubqueryCacheConfig configures the local cache.
 type LocalSubqueryCacheConfig struct {
@@ -41,24 +120,11 @@ type LocalSubqueryCacheConfig struct {
 	TTL          time.Duration // Entries older than TTL are evicted. 0 = no expiry.
 }
 
-// LocalSubqueryCache is a simple in-memory cache for POC/testing.
-// It persists across query evaluations when passed via query.Options.
+// LocalSubqueryCache wraps MockSubqueryCache with the legacy []float64 interface.
+// Used only by tests that haven't been migrated yet.
 type LocalSubqueryCache struct {
-	mu     sync.RWMutex
-	store  map[string]cacheEntry
-	latest map[string]int64
+	mock   *MockSubqueryCache
 	config LocalSubqueryCacheConfig
-
-	// Stats.
-	hits      int64
-	misses    int64
-	evictions int64
-	sizeBytes int64
-}
-
-type cacheEntry struct {
-	values    []float64
-	createdAt time.Time
 }
 
 func NewLocalSubqueryCache() *LocalSubqueryCache {
@@ -70,117 +136,31 @@ func NewLocalSubqueryCache() *LocalSubqueryCache {
 
 func NewLocalSubqueryCacheWithConfig(cfg LocalSubqueryCacheConfig) *LocalSubqueryCache {
 	return &LocalSubqueryCache{
-		store:  make(map[string]cacheEntry),
-		latest: make(map[string]int64),
+		mock:   NewMockSubqueryCache(),
 		config: cfg,
 	}
 }
 
-func (c *LocalSubqueryCache) Get(key string) []float64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.store[key]
-	if !ok {
-		c.misses++
-		return nil
-	}
-	// Check TTL.
-	if c.config.TTL > 0 && time.Since(entry.createdAt) > c.config.TTL {
-		c.misses++
-		c.sizeBytes -= int64(len(entry.values) * 8)
-		c.evictions++
-		delete(c.store, key)
-		return nil
-	}
-	c.hits++
-	return entry.values
+// Get delegates to the underlying mock.
+func (c *LocalSubqueryCache) Get(key string) []byte {
+	return c.mock.Get(key)
 }
 
-func (c *LocalSubqueryCache) Put(key string, values []float64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	entrySize := int64(len(values) * 8)
-
-	// Enforce size limit — skip if adding this would exceed.
-	if c.config.MaxSizeBytes > 0 && c.sizeBytes+entrySize > c.config.MaxSizeBytes {
-		// Don't cache — would exceed limit.
-		return
-	}
-
-	// Remove old entry if replacing.
-	if old, exists := c.store[key]; exists {
-		c.sizeBytes -= int64(len(old.values) * 8)
-	}
-
-	cp := make([]float64, len(values))
-	copy(cp, values)
-	c.store[key] = cacheEntry{values: cp, createdAt: time.Now()}
-	c.sizeBytes += entrySize
-
-	// Update latest timestamp tracking.
-	lastColon := strings.LastIndex(key, ":")
-	if lastColon > 0 {
-		prefix := key[:lastColon]
-		var ts int64
-		for _, ch := range key[lastColon+1:] {
-			if ch >= '0' && ch <= '9' {
-				ts = ts*10 + int64(ch-'0')
-			}
-		}
-		if ts > c.latest[prefix] {
-			c.latest[prefix] = ts
-		}
-	}
+// GetMulti delegates to the underlying mock.
+func (c *LocalSubqueryCache) GetMulti(keys []string) map[string][]byte {
+	return c.mock.GetMulti(keys)
 }
 
-func (c *LocalSubqueryCache) GetLatestTimestamp(keyPrefix string) int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if ts, ok := c.latest[keyPrefix]; ok {
-		return ts
-	}
-	return -1
+// Put delegates to the underlying mock.
+func (c *LocalSubqueryCache) Put(key string, value []byte) {
+	c.mock.Put(key, value)
 }
 
-func (c *LocalSubqueryCache) DeleteBefore(keyPrefix string, beforeTimestamp int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key, entry := range c.store {
-		if !strings.HasPrefix(key, keyPrefix) {
-			continue
-		}
-		// Parse timestamp from key suffix.
-		lastColon := strings.LastIndex(key, ":")
-		if lastColon < 0 {
-			continue
-		}
-		var ts int64
-		for _, ch := range key[lastColon+1:] {
-			if ch >= '0' && ch <= '9' {
-				ts = ts*10 + int64(ch-'0')
-			} else if ch == '-' {
-				// negative timestamp — skip deletion for simplicity
-				ts = -1
-				break
-			}
-		}
-		if ts >= 0 && ts < beforeTimestamp {
-			c.sizeBytes -= int64(len(entry.values) * 8)
-			c.evictions++
-			delete(c.store, key)
-		}
-	}
+// Delete delegates to the underlying mock.
+func (c *LocalSubqueryCache) Delete(key string) {
+	c.mock.Delete(key)
 }
 
 func (c *LocalSubqueryCache) Stats() CacheStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return CacheStats{
-		Entries:   len(c.store),
-		SizeBytes: c.sizeBytes,
-		Hits:      c.hits,
-		Misses:    c.misses,
-		Evictions: c.evictions,
-	}
+	return c.mock.Stats()
 }

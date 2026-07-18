@@ -5,8 +5,8 @@ package scan
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
-	"math"
 	"testing"
 	"time"
 
@@ -99,12 +99,12 @@ func TestCachedSubqueryOperator_WarmCache(t *testing.T) {
 	keyPrefix := fmt.Sprintf("sq:tenant1:%016x", logicalplan.NodeFingerprint(innerExpr))
 
 	// Pre-populate cache (simulating previous evaluation).
-	cache.Put(keyPrefix+":2000", []float64{3.0, 4.0})
-	cache.Put(keyPrefix+":3000", []float64{5.0, 6.0})
+	cache.Put(keyPrefix+":2000", query.EncodeFloats([]float64{3.0, 4.0}))
+	cache.Put(keyPrefix+":3000", query.EncodeFloats([]float64{5.0, 6.0}))
 
 	// Pre-populate series hash for the series set used by the mock operators.
 	mockSeries := []labels.Labels{labels.FromStrings("a", "1")}
-	cache.Put("meta:"+keyPrefix+":series_hash", []float64{math.Float64frombits(seriesSetHash(mockSeries))})
+	var hashBytes [8]byte; binary.LittleEndian.PutUint64(hashBytes[:], seriesSetHash(mockSeries)); cache.Put("meta:"+keyPrefix+":series_hash", hashBytes[:])
 
 	// This evaluation needs steps [2000, 3000, 4000].
 	// Steps 2000, 3000 are cached. Step 4000 is new.
@@ -217,7 +217,7 @@ func TestCachedSubqueryOperator_RulerSimulation(t *testing.T) {
 	// Verify cache is populated.
 	testutil.Assert(t, cache.Get(keyPrefix+":1000") != nil)
 	testutil.Assert(t, cache.Get(keyPrefix+":5000") != nil)
-	testutil.Equals(t, int64(5000), cache.GetLatestTimestamp(keyPrefix))
+	latestData := cache.Get("meta:" + keyPrefix + ":latest_ts"); testutil.Assert(t, latestData != nil && int64(binary.LittleEndian.Uint64(latestData[:8])) == 5000)
 
 	// --- Evaluation 2: Warm (range [2000, 6000], step=1000) ---
 	// Steps 2000-5000 should be cached. Step 6000 is new.
@@ -259,7 +259,7 @@ func TestCachedSubqueryOperator_RulerSimulation(t *testing.T) {
 	testutil.Equals(t, true, narrowInner2.called)
 
 	// Verify new step is cached.
-	testutil.Equals(t, int64(6000), cache.GetLatestTimestamp(keyPrefix))
+	latestData2 := cache.Get("meta:" + keyPrefix + ":latest_ts"); testutil.Assert(t, latestData2 != nil && int64(binary.LittleEndian.Uint64(latestData2[:8])) == 6000)
 
 	// --- Evaluation 3: Delayed by 2 steps (range [4000, 8000], step=1000) ---
 	// Steps 4000-6000 cached. Steps 7000, 8000 are new.
@@ -299,5 +299,5 @@ func TestCachedSubqueryOperator_RulerSimulation(t *testing.T) {
 
 	testutil.Equals(t, false, fullInner3.called)
 	testutil.Equals(t, true, narrowInner3.called)
-	testutil.Equals(t, int64(8000), cache.GetLatestTimestamp(keyPrefix))
+	latestData3 := cache.Get("meta:" + keyPrefix + ":latest_ts"); testutil.Assert(t, latestData3 != nil && int64(binary.LittleEndian.Uint64(latestData3[:8])) == 8000)
 }

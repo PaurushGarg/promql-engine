@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
-	"math"
 	"sync"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -164,8 +163,8 @@ func (c *cachedSubqueryOperator) Next(ctx context.Context, buf []model.StepVecto
 func (c *cachedSubqueryOperator) decide() {
 	// First, validate that the series set hasn't changed since data was cached.
 	// If it has, the positional cache entries are invalid — fall back to cold start.
-	cachedHashSlice := c.cache.Get(c.seriesHashKey())
-	if cachedHashSlice == nil || len(cachedHashSlice) != 1 {
+	cachedHashData := c.cache.Get(c.seriesHashKey())
+	if cachedHashData == nil || len(cachedHashData) < 8 {
 		// No cached series hash means no valid cache data exists.
 		c.useCache = false
 		return
@@ -178,7 +177,7 @@ func (c *cachedSubqueryOperator) decide() {
 		return
 	}
 	currentHash := seriesSetHash(series)
-	cachedHash := math.Float64bits(cachedHashSlice[0])
+	cachedHash := binary.LittleEndian.Uint64(cachedHashData[:8])
 
 	if currentHash != cachedHash {
 		// Series set changed (churn) — invalidate and cold start.
@@ -186,15 +185,25 @@ func (c *cachedSubqueryOperator) decide() {
 		return
 	}
 
-	// Series set matches. Load cached steps for our range.
+	// Series set matches. Load cached steps for our range using batch get.
+	keys := make([]string, 0, (c.maxt-c.mint)/c.step+1)
 	for t := c.mint; t <= c.maxt; t += c.step {
-		key := c.cacheKey(t)
-		if vals := c.cache.Get(key); vals != nil {
-			c.cachedSteps = append(c.cachedSteps, cachedStepEntry{t: t, samples: vals})
-		} else {
-			// First miss — everything from here is uncached.
+		keys = append(keys, c.cacheKey(t))
+	}
+	results := c.cache.GetMulti(keys)
+
+	// Walk keys in order; stop at first miss.
+	for i, key := range keys {
+		data, ok := results[key]
+		if !ok || data == nil {
 			break
 		}
+		vals := query.DecodeFloats(data)
+		if vals == nil {
+			break
+		}
+		t := c.mint + int64(i)*c.step
+		c.cachedSteps = append(c.cachedSteps, cachedStepEntry{t: t, samples: vals})
 	}
 	// Use cache path if we have at least one cached step.
 	c.useCache = len(c.cachedSteps) > 0
@@ -233,12 +242,21 @@ func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf
 	// Cache newly computed steps (skip if cardinality too high).
 	for i := 0; i < vecN; i++ {
 		if len(innerBuf[i].Samples) <= maxCacheableSeriesPerStep {
-			c.cache.Put(c.cacheKey(innerBuf[i].T), innerBuf[i].Samples)
+			c.cache.Put(c.cacheKey(innerBuf[i].T), query.EncodeFloats(innerBuf[i].Samples))
 		}
 	}
 
-	// Cleanup: remove entries that have fallen out of the window.
-	c.cache.DeleteBefore(c.keyPrefix, c.mint)
+	// Update latest timestamp for narrowInner start calculation on next eval.
+	if vecN > 0 {
+		var tsBytes [8]byte
+		binary.LittleEndian.PutUint64(tsBytes[:], uint64(innerBuf[vecN-1].T))
+		c.cache.Put(c.latestTimestampKey(), tsBytes[:])
+	}
+
+	// Explicit eviction: delete the step that just fell out of the window.
+	if c.mint > c.step {
+		c.cache.Delete(c.cacheKey(c.mint - c.step))
+	}
 
 	return n + vecN, nil
 }
@@ -252,16 +270,24 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 	// Cache all produced steps for next evaluation (skip if cardinality too high).
 	for i := 0; i < vecN; i++ {
 		if len(buf[i].Samples) <= maxCacheableSeriesPerStep {
-			c.cache.Put(c.cacheKey(buf[i].T), buf[i].Samples)
+			c.cache.Put(c.cacheKey(buf[i].T), query.EncodeFloats(buf[i].Samples))
 		}
 	}
 
 	// Store the series hash so the next evaluation can validate the series set.
-	// This is called on cold start, so we compute and store the hash once.
 	series, seriesErr := c.fullInner.Series(ctx)
 	if seriesErr == nil && len(series) > 0 {
 		hash := seriesSetHash(series)
-		c.cache.Put(c.seriesHashKey(), []float64{math.Float64frombits(hash)})
+		var hashBytes [8]byte
+		binary.LittleEndian.PutUint64(hashBytes[:], hash)
+		c.cache.Put(c.seriesHashKey(), hashBytes[:])
+	}
+
+	// Store the latest cached timestamp for narrowInner start calculation.
+	if vecN > 0 {
+		var tsBytes [8]byte
+		binary.LittleEndian.PutUint64(tsBytes[:], uint64(buf[vecN-1].T))
+		c.cache.Put(c.latestTimestampKey(), tsBytes[:])
 	}
 
 	return vecN, nil
@@ -272,8 +298,10 @@ func (c *cachedSubqueryOperator) cacheKey(timestamp int64) string {
 }
 
 func (c *cachedSubqueryOperator) seriesHashKey() string {
-	// Use "meta:" prefix to distinguish from step keys (which use the keyPrefix directly).
-	// This prevents DeleteBefore from accidentally evicting the series hash,
-	// since DeleteBefore only targets keys starting with c.keyPrefix.
+	// Use "meta:" prefix to distinguish from step keys.
 	return "meta:" + c.keyPrefix + ":series_hash"
+}
+
+func (c *cachedSubqueryOperator) latestTimestampKey() string {
+	return "meta:" + c.keyPrefix + ":latest_ts"
 }

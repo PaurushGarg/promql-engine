@@ -18,6 +18,7 @@ package execution
 
 import (
 	"context"
+	enc "encoding/binary"
 	"fmt"
 	"sort"
 	"time"
@@ -219,7 +220,11 @@ func newSubqueryFunction(ctx context.Context, e *logicalplan.FunctionCall, t *lo
 	if nOpts.SubqueryCache != nil {
 		exprFingerprint := logicalplan.NodeFingerprint(t.Expr)
 		keyPrefix := fmt.Sprintf("sq:%s:%016x", nOpts.TenantID, exprFingerprint)
-		latestCached := nOpts.SubqueryCache.GetLatestTimestamp(keyPrefix)
+		latestKey := "meta:" + keyPrefix + ":latest_ts"
+		latestCached := int64(-1)
+		if data := nOpts.SubqueryCache.Get(latestKey); len(data) >= 8 {
+			latestCached = int64(enc.LittleEndian.Uint64(data[:8]))
+		}
 
 		// Build a narrow inner operator covering only the uncached portion.
 		narrowStart := nOpts.End // default: empty range (cold start uses fullInner)
