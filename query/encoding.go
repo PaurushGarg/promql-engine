@@ -350,3 +350,225 @@ func decodeFloatHistogram(data []byte) *histogram.FloatHistogram {
 
 	return h
 }
+
+// --- Hash-based step and series key encoding for Option 2 cache design ---
+
+// HashedSample represents a single series value keyed by label hash.
+type HashedSample struct {
+	Hash  uint64
+	Value float64
+}
+
+// HashedHistogramSample represents a single histogram value keyed by label hash.
+type HashedHistogramSample struct {
+	Hash      uint64
+	Histogram *histogram.FloatHistogram
+}
+
+// HashedStepData holds per-step data keyed by label hash (not positional).
+// This is the format stored in per-step cache keys.
+type HashedStepData struct {
+	Samples    []HashedSample
+	Histograms []HashedHistogramSample
+}
+
+// EncodeHashedStepData serializes a HashedStepData to compressed bytes.
+// Format: snappy([numSamples:u32][numHistograms:u32]
+//
+//	[hash:u64, value:f64]... (samples)
+//	[hash:u64, histLen:u32, histBytes...]... (histograms))
+func EncodeHashedStepData(data *HashedStepData) []byte {
+	if data == nil || (len(data.Samples) == 0 && len(data.Histograms) == 0) {
+		return nil
+	}
+
+	size := 8 + len(data.Samples)*16 + len(data.Histograms)*256
+	buf := make([]byte, 0, size)
+
+	var header [8]byte
+	binary.LittleEndian.PutUint32(header[:4], uint32(len(data.Samples)))
+	binary.LittleEndian.PutUint32(header[4:], uint32(len(data.Histograms)))
+	buf = append(buf, header[:]...)
+
+	// Samples: [hash:u64][value:f64] pairs.
+	var pair [16]byte
+	for _, s := range data.Samples {
+		binary.LittleEndian.PutUint64(pair[:8], s.Hash)
+		binary.LittleEndian.PutUint64(pair[8:], math.Float64bits(s.Value))
+		buf = append(buf, pair[:]...)
+	}
+
+	// Histograms: [hash:u64][length:u32][encoded histogram bytes].
+	for _, h := range data.Histograms {
+		var hdr [12]byte
+		binary.LittleEndian.PutUint64(hdr[:8], h.Hash)
+		hBytes := encodeFloatHistogram(h.Histogram)
+		binary.LittleEndian.PutUint32(hdr[8:], uint32(len(hBytes)))
+		buf = append(buf, hdr[:]...)
+		buf = append(buf, hBytes...)
+	}
+
+	return snappy.Encode(nil, buf)
+}
+
+// DecodeHashedStepData deserializes compressed bytes back to HashedStepData.
+func DecodeHashedStepData(data []byte) *HashedStepData {
+	if len(data) == 0 {
+		return nil
+	}
+	raw, err := snappy.Decode(nil, data)
+	if err != nil || len(raw) < 8 {
+		return nil
+	}
+
+	numSamples := binary.LittleEndian.Uint32(raw[:4])
+	numHistograms := binary.LittleEndian.Uint32(raw[4:8])
+	offset := 8
+
+	result := &HashedStepData{}
+
+	// Decode samples.
+	if numSamples > 0 {
+		needed := int(numSamples) * 16
+		if offset+needed > len(raw) {
+			return nil
+		}
+		result.Samples = make([]HashedSample, numSamples)
+		for i := uint32(0); i < numSamples; i++ {
+			result.Samples[i].Hash = binary.LittleEndian.Uint64(raw[offset:])
+			result.Samples[i].Value = math.Float64frombits(binary.LittleEndian.Uint64(raw[offset+8:]))
+			offset += 16
+		}
+	}
+
+	// Decode histograms.
+	if numHistograms > 0 {
+		result.Histograms = make([]HashedHistogramSample, 0, numHistograms)
+		for i := uint32(0); i < numHistograms; i++ {
+			if offset+12 > len(raw) {
+				break
+			}
+			hash := binary.LittleEndian.Uint64(raw[offset:])
+			hLen := binary.LittleEndian.Uint32(raw[offset+8:])
+			offset += 12
+			if offset+int(hLen) > len(raw) {
+				break
+			}
+			h := decodeFloatHistogram(raw[offset : offset+int(hLen)])
+			offset += int(hLen)
+			if h != nil {
+				result.Histograms = append(result.Histograms, HashedHistogramSample{Hash: hash, Histogram: h})
+			}
+		}
+	}
+
+	return result
+}
+
+// SeriesEntry is one entry in the series key: a label hash mapped to its full labels.
+type SeriesEntry struct {
+	Hash   uint64
+	Labels []SeriesLabel
+}
+
+// SeriesLabel is a single label key-value pair.
+type SeriesLabel struct {
+	Name  string
+	Value string
+}
+
+// EncodeSeriesKey serializes a list of SeriesEntry to compressed bytes.
+// Format: snappy([numSeries:u32]
+//
+//	[hash:u64][numLabels:u16][nameLen:u16][name...][valueLen:u16][value...]... per series)
+func EncodeSeriesKey(entries []SeriesEntry) []byte {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	size := 4 + len(entries)*100 // rough estimate
+	buf := make([]byte, 0, size)
+
+	var numBuf [4]byte
+	binary.LittleEndian.PutUint32(numBuf[:], uint32(len(entries)))
+	buf = append(buf, numBuf[:]...)
+
+	for _, entry := range entries {
+		var hashBuf [8]byte
+		binary.LittleEndian.PutUint64(hashBuf[:], entry.Hash)
+		buf = append(buf, hashBuf[:]...)
+
+		var nlBuf [2]byte
+		binary.LittleEndian.PutUint16(nlBuf[:], uint16(len(entry.Labels)))
+		buf = append(buf, nlBuf[:]...)
+
+		for _, lbl := range entry.Labels {
+			// Name length + name bytes.
+			binary.LittleEndian.PutUint16(nlBuf[:], uint16(len(lbl.Name)))
+			buf = append(buf, nlBuf[:]...)
+			buf = append(buf, lbl.Name...)
+			// Value length + value bytes.
+			binary.LittleEndian.PutUint16(nlBuf[:], uint16(len(lbl.Value)))
+			buf = append(buf, nlBuf[:]...)
+			buf = append(buf, lbl.Value...)
+		}
+	}
+
+	return snappy.Encode(nil, buf)
+}
+
+// DecodeSeriesKey deserializes compressed bytes back to []SeriesEntry.
+func DecodeSeriesKey(data []byte) []SeriesEntry {
+	if len(data) == 0 {
+		return nil
+	}
+	raw, err := snappy.Decode(nil, data)
+	if err != nil || len(raw) < 4 {
+		return nil
+	}
+
+	numSeries := binary.LittleEndian.Uint32(raw[:4])
+	offset := 4
+
+	entries := make([]SeriesEntry, 0, numSeries)
+	for i := uint32(0); i < numSeries; i++ {
+		if offset+10 > len(raw) {
+			break
+		}
+		hash := binary.LittleEndian.Uint64(raw[offset:])
+		offset += 8
+		numLabels := binary.LittleEndian.Uint16(raw[offset:])
+		offset += 2
+
+		labels := make([]SeriesLabel, 0, numLabels)
+		for j := uint16(0); j < numLabels; j++ {
+			if offset+2 > len(raw) {
+				return entries
+			}
+			nameLen := binary.LittleEndian.Uint16(raw[offset:])
+			offset += 2
+			if offset+int(nameLen) > len(raw) {
+				return entries
+			}
+			name := string(raw[offset : offset+int(nameLen)])
+			offset += int(nameLen)
+
+			if offset+2 > len(raw) {
+				return entries
+			}
+			valueLen := binary.LittleEndian.Uint16(raw[offset:])
+			offset += 2
+			if offset+int(valueLen) > len(raw) {
+				return entries
+			}
+			value := string(raw[offset : offset+int(valueLen)])
+			offset += int(valueLen)
+
+			labels = append(labels, SeriesLabel{Name: name, Value: value})
+		}
+
+		entries = append(entries, SeriesEntry{Hash: hash, Labels: labels})
+	}
+
+	return entries
+}

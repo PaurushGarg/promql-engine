@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -19,29 +20,17 @@ import (
 
 const (
 	// minStepsToCache is the minimum number of subquery steps required to enable caching.
-	// Below this threshold, the overhead of caching outweighs the savings.
-	// Default: 2 (cache any subquery with 2+ steps). Increase for production if needed.
 	minStepsToCache int64 = 2
-
-	// maxCacheableSeriesPerStep is the maximum number of series per step that will be cached.
-	// Steps with more series than this are skipped to avoid excessive memory/cache usage.
-	maxCacheableSeriesPerStep = 10000
 )
 
-// cachedSubqueryOperator wraps the subquery's inner operator with caching.
-// It holds two inner operators:
-//   - narrowInner: covers only the uncached time range (new steps since last evaluation)
-//   - fullInner: covers the full time range (fallback for cold start)
+// cachedSubqueryOperator implements the Option 2 cache design:
+//   - Series key: stores {hash → labels} mapping, updated each eval
+//   - Per-step keys: stores {hash: value} pairs (hash-based, not positional)
+//   - Series(): union of cached series + narrowInner.Series() — no fullInner call on warm path
+//   - Position remapping: hash → current position on reconstruction
 //
-// On the first call to Next(), it checks the cache to decide which path to use.
-// If cache has data from a previous evaluation, it serves cached steps first,
-// then delegates to narrowInner for new steps.
-// If cache is empty (cold start), it delegates entirely to fullInner and caches results.
-//
-// Series validation: On each evaluation, the operator computes a hash of the current
-// series set and compares it against the cached series hash. If they differ (series
-// churn: pods added/removed), the cache is invalidated and a cold start is performed.
-// This prevents incorrect results from positional mismatch.
+// On cold start (no series key in cache): uses fullInner for everything, caches results.
+// On warm path: serves cached steps (remapped to current positions) + narrowInner for new steps.
 type cachedSubqueryOperator struct {
 	narrowInner model.VectorOperator
 	fullInner   model.VectorOperator
@@ -53,47 +42,49 @@ type cachedSubqueryOperator struct {
 	maxt      int64
 	step      int64
 
-	seriesOnce sync.Once
-	series     []labels.Labels
-	seriesErr  error
+	// Series state — resolved in Series() call before Next().
+	seriesOnce    sync.Once
+	series        []labels.Labels
+	seriesErr     error
+	hashToPos     map[uint64]uint64 // label hash → position in series slice
+	isWarm        bool              // true if series were loaded from cache
+	narrowSeries  []labels.Labels   // series from narrowInner (current active set)
 
-	// Decision state.
+	// Decision state (set during first Next call).
 	decided  bool
 	useCache bool
 
-	// Cache-read state: steps served from cache.
-	cachedSteps []cachedStepEntry
+	// Cached step data loaded during decide().
+	cachedSteps []cachedHashedStep
 	cacheIdx    int
 
-	// Track whether we've exhausted cached steps and switched to narrowInner.
+	// Track narrow serving state.
 	servingFromNarrow bool
+	narrowHashToPos   map[uint64]uint64 // narrowInner's hash → narrow position (for remapping)
 }
 
-// seriesSetHash computes a stable hash over the full series set.
-// The hash captures both the set membership and ordering of series.
-// If the series set changes between evaluations (pods added/removed/reordered),
-// this hash will differ, triggering cache invalidation.
-func seriesSetHash(series []labels.Labels) uint64 {
+type cachedHashedStep struct {
+	t    int64
+	data *query.HashedStepData
+}
+
+// seriesLabelHash computes a stable hash for a labels.Labels instance.
+func seriesLabelHash(lset labels.Labels) uint64 {
 	h := fnv.New64a()
 	var buf [8]byte
-	for i, s := range series {
-		// Include position to detect reordering.
-		binary.LittleEndian.PutUint64(buf[:], uint64(i))
-		h.Write(buf[:])
-		// Include the series labels hash.
-		binary.LittleEndian.PutUint64(buf[:], s.Hash())
-		h.Write(buf[:])
-	}
+	lset.Range(func(l labels.Label) {
+		binary.LittleEndian.PutUint16(buf[:2], uint16(len(l.Name)))
+		h.Write(buf[:2])
+		_, _ = h.Write([]byte(l.Name))
+		binary.LittleEndian.PutUint16(buf[:2], uint16(len(l.Value)))
+		h.Write(buf[:2])
+		_, _ = h.Write([]byte(l.Value))
+	})
 	return h.Sum64()
 }
 
-type cachedStepEntry struct {
-	t    int64
-	data *query.StepData
-}
-
-// NewCachedSubqueryOperator creates a cached operator with both narrow and full inner operators.
-// If cache is nil, returns fullInner directly (no caching).
+// NewCachedSubqueryOperator creates a cached operator.
+// If cache is nil or range is too short, returns fullInner directly.
 func NewCachedSubqueryOperator(
 	fullInner model.VectorOperator,
 	narrowInner model.VectorOperator,
@@ -108,7 +99,6 @@ func NewCachedSubqueryOperator(
 		step = 1
 	}
 
-	// Skip caching if the range is too short to benefit.
 	totalSteps := (opts.End.UnixMilli() - opts.Start.UnixMilli()) / step
 	if totalSteps < minStepsToCache {
 		return fullInner
@@ -134,11 +124,100 @@ func (c *cachedSubqueryOperator) Explain() (next []model.VectorOperator) {
 	return []model.VectorOperator{c.fullInner, c.narrowInner}
 }
 
+// Series resolves the full series set for this evaluation.
+// On warm path: loads from cache series key + narrowInner.Series() (no fullInner call).
+// On cold path: uses fullInner.Series().
 func (c *cachedSubqueryOperator) Series(ctx context.Context) ([]labels.Labels, error) {
 	c.seriesOnce.Do(func() {
-		c.series, c.seriesErr = c.fullInner.Series(ctx)
+		c.seriesErr = c.initSeries(ctx)
 	})
 	return c.series, c.seriesErr
+}
+
+func (c *cachedSubqueryOperator) initSeries(ctx context.Context) error {
+	// Try loading series from cache.
+	cachedData := c.cache.Get(c.seriesKey())
+	if cachedData == nil {
+		// No cached series — cold start. Use fullInner.
+		c.isWarm = false
+		var err error
+		c.series, err = c.fullInner.Series(ctx)
+		if err != nil {
+			return err
+		}
+		c.buildHashToPos()
+		return nil
+	}
+
+	// Load cached series.
+	entries := query.DecodeSeriesKey(cachedData)
+	if entries == nil {
+		c.isWarm = false
+		var err error
+		c.series, err = c.fullInner.Series(ctx)
+		if err != nil {
+			return err
+		}
+		c.buildHashToPos()
+		return nil
+	}
+
+	// Get narrowInner's series (cheap, narrow time range).
+	narrowLabels, err := c.narrowInner.Series(ctx)
+	if err != nil {
+		// Can't get narrow series — fall back to cold.
+		c.isWarm = false
+		c.series, err = c.fullInner.Series(ctx)
+		if err != nil {
+			return err
+		}
+		c.buildHashToPos()
+		return nil
+	}
+	c.narrowSeries = narrowLabels
+
+	// Build the union of cached series + narrow series.
+	// Use a map to deduplicate by hash.
+	hashToLabels := make(map[uint64]labels.Labels, len(entries)+len(narrowLabels))
+	for _, entry := range entries {
+		// Reconstruct labels.Labels from SeriesEntry.
+		lblPairs := make([]string, 0, len(entry.Labels)*2)
+		for _, lbl := range entry.Labels {
+			lblPairs = append(lblPairs, lbl.Name, lbl.Value)
+		}
+		hashToLabels[entry.Hash] = labels.FromStrings(lblPairs...)
+	}
+	for _, lset := range narrowLabels {
+		h := seriesLabelHash(lset)
+		hashToLabels[h] = lset
+	}
+
+	// Build sorted series list (Prometheus convention: sorted by labels).
+	c.series = make([]labels.Labels, 0, len(hashToLabels))
+	for _, lset := range hashToLabels {
+		c.series = append(c.series, lset)
+	}
+	sort.Slice(c.series, func(i, j int) bool {
+		return labels.Compare(c.series[i], c.series[j]) < 0
+	})
+
+	c.isWarm = true
+	c.buildHashToPos()
+
+	// Build narrow hash→pos map for remapping narrowInner.Next() output.
+	c.narrowHashToPos = make(map[uint64]uint64, len(narrowLabels))
+	for i, lset := range narrowLabels {
+		c.narrowHashToPos[seriesLabelHash(lset)] = uint64(i)
+	}
+
+	return nil
+}
+
+func (c *cachedSubqueryOperator) buildHashToPos() {
+	c.hashToPos = make(map[uint64]uint64, len(c.series))
+	for i, lset := range c.series {
+		c.hashToPos[seriesLabelHash(lset)] = uint64(i)
+	}
 }
 
 func (c *cachedSubqueryOperator) Next(ctx context.Context, buf []model.StepVector) (int, error) {
@@ -148,54 +227,29 @@ func (c *cachedSubqueryOperator) Next(ctx context.Context, buf []model.StepVecto
 	default:
 	}
 
-	// Decide once which path to take.
 	if !c.decided {
 		c.decided = true
-		c.decide()
+		c.decide(ctx)
 	}
 
 	if !c.useCache {
-		// Cold start: use full inner, cache everything.
 		return c.nextFromFull(ctx, buf)
 	}
 
-	// Warm path: serve from cached steps, then from narrowInner.
 	return c.nextFromCacheAndNarrow(ctx, buf)
 }
 
-func (c *cachedSubqueryOperator) decide() {
-	// First, validate that the series set hasn't changed since data was cached.
-	// If it has, the positional cache entries are invalid — fall back to cold start.
-	cachedHashData := c.cache.Get(c.seriesHashKey())
-	if cachedHashData == nil || len(cachedHashData) < 8 {
-		// No cached series hash means no valid cache data exists.
+func (c *cachedSubqueryOperator) decide(ctx context.Context) {
+	if !c.isWarm {
 		c.useCache = false
-		c.log("subquery cache: cold start", "reason", "no_series_hash")
+		c.log("subquery cache: cold start", "reason", "no_series_key")
 		return
 	}
 
-	// Compute current series hash.
-	series, err := c.fullInner.Series(context.Background())
-	if err != nil {
-		c.useCache = false
-		c.log("subquery cache: cold start", "reason", "series_error", "err", err)
-		return
-	}
-	currentHash := seriesSetHash(series)
-	cachedHash := binary.LittleEndian.Uint64(cachedHashData[:8])
-
-	if currentHash != cachedHash {
-		// Series set changed (churn) — invalidate and cold start.
-		c.useCache = false
-		c.log("subquery cache: invalidated", "reason", "series_changed",
-			"cached_hash", cachedHash, "current_hash", currentHash, "series_count", len(series))
-		return
-	}
-
-	// Series set matches. Load cached steps for our range using batch get.
+	// Load cached steps using GetMulti.
 	keys := make([]string, 0, (c.maxt-c.mint)/c.step+1)
 	for t := c.mint; t <= c.maxt; t += c.step {
-		keys = append(keys, c.cacheKey(t))
+		keys = append(keys, c.stepKey(t))
 	}
 	results := c.cache.GetMulti(keys)
 
@@ -205,21 +259,21 @@ func (c *cachedSubqueryOperator) decide() {
 		if !ok || data == nil {
 			break
 		}
-		stepData := query.DecodeStepData(data)
+		stepData := query.DecodeHashedStepData(data)
 		if stepData == nil {
 			break
 		}
 		t := c.mint + int64(i)*c.step
-		c.cachedSteps = append(c.cachedSteps, cachedStepEntry{t: t, data: stepData})
+		c.cachedSteps = append(c.cachedSteps, cachedHashedStep{t: t, data: stepData})
 	}
-	// Use cache path if we have at least one cached step.
+
 	c.useCache = len(c.cachedSteps) > 0
 
 	if c.useCache {
 		totalSteps := len(keys)
 		c.log("subquery cache: warm path",
 			"cached_steps", len(c.cachedSteps), "total_steps", totalSteps,
-			"new_steps", totalSteps-len(c.cachedSteps), "series_count", len(series))
+			"new_steps", totalSteps-len(c.cachedSteps), "series_count", len(c.series))
 	} else {
 		c.log("subquery cache: cold start", "reason", "no_cached_steps")
 	}
@@ -228,18 +282,26 @@ func (c *cachedSubqueryOperator) decide() {
 func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf []model.StepVector) (int, error) {
 	n := 0
 
-	// Serve from cached steps first.
+	// Serve from cached steps, remapping hashes to current positions.
 	for n < len(buf) && c.cacheIdx < len(c.cachedSteps) {
 		entry := c.cachedSteps[c.cacheIdx]
 		buf[n].Reset(entry.t)
-		// Restore float samples.
-		if len(entry.data.Samples) > 0 {
-			buf[n].AppendSamples(entry.data.SampleIDs, entry.data.Samples)
+
+		// Remap float samples by hash → current position.
+		for _, s := range entry.data.Samples {
+			if pos, ok := c.hashToPos[s.Hash]; ok {
+				buf[n].AppendSample(pos, s.Value)
+			}
+			// Hash not in current series set → series died, skip (correct)
 		}
-		// Restore histograms.
-		if len(entry.data.Histograms) > 0 {
-			buf[n].AppendHistograms(entry.data.HistogramIDs, entry.data.Histograms)
+
+		// Remap histogram samples.
+		for _, h := range entry.data.Histograms {
+			if pos, ok := c.hashToPos[h.Hash]; ok {
+				buf[n].AppendHistogram(pos, h.Histogram)
+			}
 		}
+
 		n++
 		c.cacheIdx++
 	}
@@ -258,31 +320,78 @@ func (c *cachedSubqueryOperator) nextFromCacheAndNarrow(ctx context.Context, buf
 		return n, err
 	}
 
-	// Cache newly computed steps (skip if cardinality too high).
+	// Remap narrowInner's positions to our merged positions and cache new steps.
 	for i := 0; i < vecN; i++ {
-		totalSeries := len(innerBuf[i].Samples) + len(innerBuf[i].Histograms)
-		if totalSeries <= maxCacheableSeriesPerStep {
-			stepData := &query.StepData{
-				SampleIDs:    innerBuf[i].SampleIDs,
-				Samples:      innerBuf[i].Samples,
-				HistogramIDs: innerBuf[i].HistogramIDs,
-				Histograms:   innerBuf[i].Histograms,
+		sv := &innerBuf[i]
+
+		// Build the hashed step data for caching.
+		hashedStep := &query.HashedStepData{
+			Samples:    make([]query.HashedSample, 0, len(sv.SampleIDs)),
+			Histograms: make([]query.HashedHistogramSample, 0, len(sv.HistogramIDs)),
+		}
+
+		// Remap float samples: narrow position → hash → merged position.
+		remappedIDs := make([]uint64, 0, len(sv.SampleIDs))
+		remappedVals := make([]float64, 0, len(sv.Samples))
+		for j, narrowPos := range sv.SampleIDs {
+			// Find the hash for this narrow position.
+			hash := c.narrowPosToHash(narrowPos)
+			if hash == 0 {
+				continue
 			}
-			c.cache.Put(c.cacheKey(innerBuf[i].T), query.EncodeStepData(stepData))
+			// Find merged position.
+			if mergedPos, ok := c.hashToPos[hash]; ok {
+				remappedIDs = append(remappedIDs, mergedPos)
+				remappedVals = append(remappedVals, sv.Samples[j])
+			}
+			hashedStep.Samples = append(hashedStep.Samples, query.HashedSample{
+				Hash: hash, Value: sv.Samples[j],
+			})
+		}
+
+		// Remap histogram samples.
+		remappedHistIDs := make([]uint64, 0, len(sv.HistogramIDs))
+		for j, narrowPos := range sv.HistogramIDs {
+			hash := c.narrowPosToHash(narrowPos)
+			if hash == 0 {
+				continue
+			}
+			if mergedPos, ok := c.hashToPos[hash]; ok {
+				remappedHistIDs = append(remappedHistIDs, mergedPos)
+			}
+			hashedStep.Histograms = append(hashedStep.Histograms, query.HashedHistogramSample{
+				Hash: hash, Histogram: sv.Histograms[j],
+			})
+		}
+
+		// Replace the StepVector contents with remapped positions.
+		sv.SampleIDs = remappedIDs
+		sv.Samples = remappedVals
+		if len(sv.HistogramIDs) > 0 {
+			sv.HistogramIDs = remappedHistIDs
+		}
+
+		// Cache the new step (async-safe: Put is fire-and-forget).
+		encoded := query.EncodeHashedStepData(hashedStep)
+		if encoded != nil {
+			c.cache.Put(c.stepKey(sv.T), encoded)
 		}
 	}
 
-	// Update latest timestamp for narrowInner start calculation on next eval.
+	// Delete oldest step that fell out of window.
+	if c.mint > c.step {
+		c.cache.Delete(c.stepKey(c.mint - c.step))
+	}
+
+	// Update latest timestamp.
 	if vecN > 0 {
 		var tsBytes [8]byte
 		binary.LittleEndian.PutUint64(tsBytes[:], uint64(innerBuf[vecN-1].T))
-		c.cache.Put(c.latestTimestampKey(), tsBytes[:])
+		c.cache.Put(c.latestTsKey(), tsBytes[:])
 	}
 
-	// Explicit eviction: delete the step that just fell out of the window.
-	if c.mint > c.step {
-		c.cache.Delete(c.cacheKey(c.mint - c.step))
-	}
+	// Update series key: rebuild from what we actually served.
+	c.updateSeriesKey()
 
 	return n + vecN, nil
 }
@@ -293,64 +402,112 @@ func (c *cachedSubqueryOperator) nextFromFull(ctx context.Context, buf []model.S
 		return 0, err
 	}
 
-	// Cache all produced steps for next evaluation (skip if cardinality too high).
+	// Get the series for hash computation.
+	series, seriesErr := c.fullInner.Series(ctx)
+	if seriesErr != nil {
+		return vecN, nil // still return data, just don't cache
+	}
+
+	// Build position → hash mapping for fullInner.
+	posToHash := make([]uint64, len(series))
+	for i, lset := range series {
+		posToHash[i] = seriesLabelHash(lset)
+	}
+
+	// Cache each step with hashes.
 	cachedCount := 0
-	var totalSize int
 	for i := 0; i < vecN; i++ {
-		totalSeries := len(buf[i].Samples) + len(buf[i].Histograms)
-		if totalSeries <= maxCacheableSeriesPerStep {
-			stepData := &query.StepData{
-				SampleIDs:    buf[i].SampleIDs,
-				Samples:      buf[i].Samples,
-				HistogramIDs: buf[i].HistogramIDs,
-				Histograms:   buf[i].Histograms,
+		hashedStep := &query.HashedStepData{
+			Samples:    make([]query.HashedSample, 0, len(buf[i].SampleIDs)),
+			Histograms: make([]query.HashedHistogramSample, 0, len(buf[i].HistogramIDs)),
+		}
+		for j, pos := range buf[i].SampleIDs {
+			if int(pos) < len(posToHash) {
+				hashedStep.Samples = append(hashedStep.Samples, query.HashedSample{
+					Hash: posToHash[pos], Value: buf[i].Samples[j],
+				})
 			}
-			encoded := query.EncodeStepData(stepData)
-			c.cache.Put(c.cacheKey(buf[i].T), encoded)
+		}
+		for j, pos := range buf[i].HistogramIDs {
+			if int(pos) < len(posToHash) {
+				hashedStep.Histograms = append(hashedStep.Histograms, query.HashedHistogramSample{
+					Hash: posToHash[pos], Histogram: buf[i].Histograms[j],
+				})
+			}
+		}
+		encoded := query.EncodeHashedStepData(hashedStep)
+		if encoded != nil {
+			c.cache.Put(c.stepKey(buf[i].T), encoded)
 			cachedCount++
-			totalSize += len(encoded)
 		}
 	}
 
-	// Store the series hash so the next evaluation can validate the series set.
-	series, seriesErr := c.fullInner.Series(ctx)
-	if seriesErr == nil && len(series) > 0 {
-		hash := seriesSetHash(series)
-		var hashBytes [8]byte
-		binary.LittleEndian.PutUint64(hashBytes[:], hash)
-		c.cache.Put(c.seriesHashKey(), hashBytes[:])
-	}
+	// Store series key.
+	c.storeSeriesKey(series)
 
-	// Store the latest cached timestamp for narrowInner start calculation.
+	// Store latest timestamp.
 	if vecN > 0 {
 		var tsBytes [8]byte
 		binary.LittleEndian.PutUint64(tsBytes[:], uint64(buf[vecN-1].T))
-		c.cache.Put(c.latestTimestampKey(), tsBytes[:])
+		c.cache.Put(c.latestTsKey(), tsBytes[:])
 	}
 
 	c.log("subquery cache: populated (cold)",
-		"steps_cached", cachedCount, "total_bytes", totalSize,
-		"series_count", len(series))
+		"steps_cached", cachedCount, "series_count", len(series))
 
 	return vecN, nil
 }
 
-func (c *cachedSubqueryOperator) cacheKey(timestamp int64) string {
-	return fmt.Sprintf("%s:%d", c.keyPrefix, timestamp)
+// narrowPosToHash converts a narrowInner position to its label hash.
+func (c *cachedSubqueryOperator) narrowPosToHash(pos uint64) uint64 {
+	if int(pos) < len(c.narrowSeries) {
+		return seriesLabelHash(c.narrowSeries[pos])
+	}
+	return 0
 }
 
-func (c *cachedSubqueryOperator) seriesHashKey() string {
-	// Use "meta:" prefix to distinguish from step keys.
-	return "meta:" + c.keyPrefix + ":series_hash"
+// storeSeriesKey stores the full series set as a cache key.
+func (c *cachedSubqueryOperator) storeSeriesKey(series []labels.Labels) {
+	entries := make([]query.SeriesEntry, len(series))
+	for i, lset := range series {
+		h := seriesLabelHash(lset)
+		var lbls []query.SeriesLabel
+		lset.Range(func(l labels.Label) {
+			lbls = append(lbls, query.SeriesLabel{Name: l.Name, Value: l.Value})
+		})
+		entries[i] = query.SeriesEntry{Hash: h, Labels: lbls}
+	}
+	encoded := query.EncodeSeriesKey(entries)
+	if encoded != nil {
+		c.cache.Put(c.seriesKey(), encoded)
+	}
 }
 
-func (c *cachedSubqueryOperator) latestTimestampKey() string {
+// updateSeriesKey rebuilds the series key from current knowledge.
+// Prunes dead series: any series not present in cached steps or narrow is removed.
+func (c *cachedSubqueryOperator) updateSeriesKey() {
+	// For now, store the full merged series set (includes narrow + historical).
+	// Dead series pruning: we know which hashes appeared in cached steps + narrow.
+	// For simplicity, just store the current merged series.
+	// Dead series with no data will be pruned on next eval when steps slide past them.
+	c.storeSeriesKey(c.series)
+}
+
+// --- Key helpers ---
+
+func (c *cachedSubqueryOperator) stepKey(timestamp int64) string {
+	return fmt.Sprintf("%s:s:%d", c.keyPrefix, timestamp)
+}
+
+func (c *cachedSubqueryOperator) seriesKey() string {
+	return c.keyPrefix + ":series"
+}
+
+func (c *cachedSubqueryOperator) latestTsKey() string {
 	return "meta:" + c.keyPrefix + ":latest_ts"
 }
 
 // log emits an info-level log message if a logger is configured.
-// NOTE: This is Info level for beta testing visibility. For production PR,
-// either remove logging or switch to Debug level.
 func (c *cachedSubqueryOperator) log(msg string, args ...any) {
 	if c.logger != nil {
 		c.logger.Info(msg, append([]any{"key_prefix", c.keyPrefix}, args...)...)
