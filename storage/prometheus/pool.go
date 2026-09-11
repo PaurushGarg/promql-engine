@@ -28,31 +28,41 @@ func NewSelectorPool(querier storage.Querier) *SelectorPool {
 }
 
 func (p *SelectorPool) GetSelector(mint, maxt, step int64, matchers []*labels.Matcher, hints storage.SelectHints) SeriesSelector {
-	key := hashMatchers(matchers, mint, maxt, hints)
-	if _, ok := p.selectors[key]; !ok {
-		p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
+	key := hashMatchers(matchers, maxt, hints)
+	if existing, ok := p.selectors[key]; ok {
+		if mint < existing.hints.Start {
+			existing.hints.Start = mint
+		}
+		return existing
 	}
+	p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
 	return p.selectors[key]
 }
 
 func (p *SelectorPool) GetFilteredSelector(mint, maxt, step int64, matchers, filters []*labels.Matcher, hints storage.SelectHints) SeriesSelector {
-	key := hashMatchers(matchers, mint, maxt, hints)
-	if _, ok := p.selectors[key]; !ok {
-		p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
+	key := hashMatchers(matchers, maxt, hints)
+	if existing, ok := p.selectors[key]; ok {
+		if mint < existing.hints.Start {
+			existing.hints.Start = mint
+		}
+		return NewFilteredSelector(existing, NewFilter(filters))
 	}
-
+	p.selectors[key] = newSeriesSelector(p.querier, matchers, hints)
 	return NewFilteredSelector(p.selectors[key], NewFilter(filters))
 }
 
-func hashMatchers(matchers []*labels.Matcher, mint, maxt int64, hints storage.SelectHints) uint64 {
+func hashMatchers(matchers []*labels.Matcher, maxt int64, hints storage.SelectHints) uint64 {
 	sb := xxhash.New()
 	for _, m := range matchers {
 		writeMatcher(sb, m)
 	}
-	writeInt64(sb, mint)
+	// mint excluded so that different range windows (e.g. [5m] vs [2m]) share one Select().
 	writeInt64(sb, maxt)
 	writeInt64(sb, hints.Step)
-	writeString(sb, hints.Func)
+	// Only "series" affects TSDB behavior (skips chunk loading).
+	if hints.Func == "series" {
+		writeString(sb, hints.Func)
+	}
 	writeString(sb, strings.Join(hints.Grouping, ";"))
 	writeBool(sb, hints.By)
 	writeString(sb, strings.Join(hints.ProjectionLabels, ";"))
